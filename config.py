@@ -9,3 +9,6 @@ class Config(object):
 
     #set the output every STEP_PER_EPOCH iteration
     STEP_PER_EPOCH = 100
+    CH_CFG=[[8,48,96],
+            [240,144,288],
+            [240,144,288]]

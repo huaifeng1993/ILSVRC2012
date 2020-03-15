@@ -17,6 +17,8 @@ class ILSVRC(torch.utils.data.Dataset):
         
         wnids=self.load_imagenet_meta(meta_path)[0][:1000]
         images_dirs=[os.path.join(synset_dir,str(wnid)) for wnid in wnids]
+        if val:
+            images_dirs=images_dirs[:10]
         self.examples=[]
         print('loading images ...')
         for i,dir in enumerate(images_dirs):
