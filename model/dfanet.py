@@ -1,325 +1,327 @@
+# --------------------------------------------------------
+# Licensed under The MIT License [see LICENSE for details]
+# Written by SHEN HUIXIANG  (shhuixi@qq.com)
+# Created On: 2020-3-06
+# https://github.com/huaifeng1993
+# --------------------------------------------------------
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.model_zoo as model_zoo
 
-def fixed_padding(inputs, kernel_size, dilation):
-    kernel_size_effective = kernel_size + (kernel_size - 1) * (dilation - 1)
-    pad_total = kernel_size_effective - 1
-    pad_beg = pad_total // 2
-    pad_end = pad_total - pad_beg
-    padded_inputs = F.pad(inputs, (pad_beg, pad_end, pad_beg, pad_end))
-    return padded_inputs
-
 class SeparableConv2d(nn.Module):
-    def __init__(self, inplanes, planes, kernel_size=3, stride=1, dilation=1, bias=False):
+    def __init__(self, inputChannel, outputChannel, kernel_size=3, stride=1, padding=1,dilation=1, bias=True):
         super(SeparableConv2d, self).__init__()
-
-        self.conv1 = nn.Conv2d(inplanes, inplanes, kernel_size, stride, 0, dilation,
-                               groups=inplanes, bias=bias)
-        self.bn = nn.BatchNorm2d(inplanes)
-        self.pointwise = nn.Conv2d(inplanes, planes, 1, 1, 0, 1, 1, bias=bias)
-
+        self.conv1 = nn.Conv2d(inputChannel, inputChannel, kernel_size, stride, padding, dilation,
+                               groups=inputChannel, bias=bias)
+        self.pointwise = nn.Conv2d(inputChannel, outputChannel, 1, 1, 0, 1, 1, bias=bias)
     def forward(self, x):
-        x = fixed_padding(x, self.conv1.kernel_size[0], dilation=self.conv1.dilation[0])
         x = self.conv1(x)
-        x = self.bn(x)
         x = self.pointwise(x)
         return x
 
 
 # encoder block
 class Block(nn.Module):
-    def __init__(self, inplanes, planes,stride=1, dilation=1,start_with_relu=True):
+    """
+    Base block for XceptionA and DFANet.
+    inputChannel: channels of inputs of the base block.
+    outputChannel:channnels of outputs of the base block.
+    stride: stride
+    BatchNorm:
+    """
+    def __init__(self, inputChannel, outputChannel,stride=1,BatchNorm=nn.BatchNorm2d):
         super(Block, self).__init__()
 
-        if planes != inplanes or stride != 1:
-            self.skip = nn.Conv2d(inplanes, planes, 1, stride=stride, bias=False)
-            self.skipbn = nn.BatchNorm2d(planes)
-        else:
-            self.skip = None
-        first_conv=[]
-
-        rep = []
-
-
-        #Deep SeparableConv1
-        if start_with_relu:
-            first_conv.append(nn.ReLU())
-            first_conv.append(SeparableConv2d(inplanes, planes//4, 3, 1, dilation))
-            first_conv.append(nn.BatchNorm2d(planes//4))
-            first_conv.append(nn.ReLU())
-        if  not start_with_relu:
-            first_conv.append(SeparableConv2d(inplanes, planes//4, 3, 1, dilation))
-            first_conv.append(nn.BatchNorm2d(planes//4))
-            first_conv.append(nn.ReLU())
-
-        rep.append(SeparableConv2d(planes//4, planes//4, 3, 1, dilation))
-        rep.append(nn.BatchNorm2d(planes//4))
-
-
-        if stride != 1:
-            rep.append(nn.ReLU())
-            rep.append(SeparableConv2d(planes//4, planes, 3, 2))
-            rep.append(nn.BatchNorm2d(planes))
-
-        if stride == 1 :
-            rep.append(nn.ReLU())
-            rep.append(SeparableConv2d(planes//4, planes, 3, 1))
-            rep.append(nn.BatchNorm2d(planes))
-
-        self.first_conv=nn.Sequential(*first_conv)
-        self.rep = nn.Sequential(*rep)
-
-    def forward(self, inp):
-        x=self.first_conv(inp)
-        x = self.rep(x) 
-
-        if self.skip is not None:
-            skip = self.skip(inp)
-            skip = self.skipbn(skip)
-        else:
-            skip = inp
-
-        x = x + skip
-
-        return x
+        self.conv1=nn.Sequential(SeparableConv2d(inputChannel,outputChannel//4,stride=stride,),
+                                BatchNorm(outputChannel//4),
+                                nn.ReLU())
+        self.conv2=nn.Sequential(SeparableConv2d(outputChannel//4,outputChannel//4),
+                                BatchNorm(outputChannel//4),
+                                nn.ReLU())
+        self.conv3=nn.Sequential(SeparableConv2d(outputChannel//4,outputChannel),
+                                BatchNorm(outputChannel),
+                                nn.ReLU())
+        self.projection=nn.Conv2d(inputChannel,outputChannel,1,stride=stride,bias=False)
+        
+       
+    def forward(self, x):
+        out=self.conv1(x)
+        out=self.conv2(out)
+        out=self.conv3(out)
+        identity=self.projection(x)
+        return out+identity
 
 
 class enc(nn.Module):
     """
     encoders:
-    stage:stage=X ,where X means encX,example: stage=2 that means you defined the encoder enc2
+    in_channels:The channels of input feature maps
+    out_channnel:the channels of outputs of this enc.
     """
-    def __init__(self,in_channels,out_channels,stage):
+    def __init__(self,in_channels,out_channels,stride=2,num_repeat=3):
         super(enc, self).__init__()
-        if(stage==2 or stage==4):
-            rep_nums=4
-        elif(stage==3):
-            rep_nums=6
-        rep=[]
-        rep.append(Block(in_channels, out_channels, stride=2,start_with_relu=False))
-        for i in range(rep_nums-1):
-            rep.append(Block(out_channels, out_channels, stride=1,start_with_relu=True))
-
-        self.reps = nn.Sequential(*rep)
-
-    def forward(self, lp):
-        x=self.reps(lp)
+        stacks=[Block(in_channels,out_channels,stride=2)]
+        for x in range(num_repeat-1):
+            stacks.append(Block(out_channels,out_channels))
+        self.build=nn.Sequential(*stacks)
+        # self.block1=Block(in_channels,out_channels,stride=2)
+        # self.block2=Block(out_channels,out_channels)
+        # self.block3=Block(out_channels,out_channels)
+    def forward(self, x):
+        x=self.build(x)
+        # x=self.block2(x)
+        # x=self.block3(x)
         return x
 
-class fcattention(nn.Module):
-    def __init__(self,in_channels,out_channels):
-        super(fcattention,self).__init__()
-        self.avg_pool=nn.AdaptiveAvgPool2d(1)
+class Attention(nn.Module):
+    """
+    self attention model.
 
+    """
+    def __init__(self,in_channels,out_channels):
+        super(Attention,self).__init__()
+        self.avg_pool=nn.AdaptiveAvgPool2d(1)
         self.fc=nn.Sequential(
             nn.Linear(in_channels,1000,bias=False),
-            #nn.ReLU(inplace=True),
-        )
-
-        self.conv=nn.Sequential(
-            nn.Conv2d(1000,out_channels,kernel_size=1,bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU()
+            nn.ReLU(inplace=True),
+            nn.Linear(1000, out_channels, bias=False),
+            nn.Sigmoid()
         )
 
     def forward(self,x):
         b,c,_,_=x.size()
         y=self.avg_pool(x).view(b,c)
-        #print(y.size())
-        y=self.fc(y).view(b,1000,1,1)
-        #print(y.size())
-        y=self.conv(y)
+        y=self.fc(y).view(b,c,1,1)
         return x*y.expand_as(x)
 
-class xceptionAx3(nn.Module):
+        
+class SubBranch(nn.Module):
     """
+    channel_cfg: channels of the inputs of enc stage
+    branch_index: 0,1,2,
     """
-    def __init__(self,num_classes):
-        super(xceptionAx3, self).__init__()
+    def __init__(self,channel_cfg,branch_index):
+        super(SubBranch,self).__init__()
+        self.enc2=enc(channel_cfg[0],48,num_repeat=3)
+        self.enc3=enc(channel_cfg[1],96,num_repeat=6)
+        self.enc4=enc(channel_cfg[2],192,num_repeat=3)
+        self.atten=Attention(192,192)
+        self.branch_index=branch_index
+    
+    def forward(self,x0,*args):
+        out0=self.enc2(x0)
+        if self.branch_index in [1,2]:
+            out1=self.enc3(torch.cat([out0,args[0]],1))
+            out2=self.enc4(torch.cat([out1,args[1]],1))
+        else:
+            out1=self.enc3(out0)
+            out2=self.enc4(out1)
+        out3=self.atten(out2)
+        return [out0,out1,out2,out3]    
+
+class XceptionA(nn.Module):
+    """
+    channel_cfg:channels of inputs of enc block.
+    num_classes:
+    """
+    def __init__(self,channel_cfg,num_classes):
+        super(XceptionA, self).__init__()
         self.conv1=nn.Sequential(nn.Conv2d(in_channels=3,out_channels=8,kernel_size=3,stride=2,padding=1,bias=False),
                                 nn.BatchNorm2d(num_features=8),
                                 nn.ReLU())
-        self.enc2a=enc(in_channels=8,out_channels=48,stage=2)
-        self.enc2b=enc(in_channels=240,out_channels=48,stage=2)
-        self.enc2c=enc(in_channels=240,out_channels=48,stage=2)
+        self.branch=SubBranch(channel_cfg,branch_index=0)
+        self.avg_pool=nn.AdaptiveAvgPool2d(1)
+    
+        self.classifier=nn.Sequential(nn.Linear(192,1000),
+                                      nn.ReLU(inplace=True),
+                                      nn.Linear(1000,num_classes))
+        for m in self.modules():
+            weight_init(m)
 
-        self.enc3a=enc(in_channels=48,out_channels=96,stage=3)
-        self.enc3b=enc(in_channels=144,out_channels=96,stage=3)
-        self.enc3c=enc(in_channels=144,out_channels=96,stage=3)
+    def forward(self,x):
+        b,c,_,_=x.size()
+        x=self.conv1(x)
+        _,_,_,x=self.branch(x)
+        x=self.avg_pool(x).view(b,-1)
+        x=self.classifier(x)
+        return x
 
-        self.enc4a=enc(in_channels=96,out_channels=192,stage=4)
-        self.enc4b=enc(in_channels=288,out_channels=192,stage=4)
-        self.enc4c=enc(in_channels=288,out_channels=192,stage=4)
+class DFA_Encoder(nn.Module):
+    """
+    Encoder of DFANet.
+    """
+    def __init__(self,channel_cfg):
+        super(DFA_Encoder,self).__init__()
+        self.conv1=nn.Sequential(nn.Conv2d(in_channels=3,out_channels=8,kernel_size=3,stride=2,padding=1,bias=False),
+                                nn.BatchNorm2d(num_features=8),
+                                nn.ReLU())
+        self.branch0=SubBranch(channel_cfg[0],branch_index=0)
+        self.branch1=SubBranch(channel_cfg[1],branch_index=1)
+        self.branch2=SubBranch(channel_cfg[2],branch_index=2)
 
-        self.fca1=fcattention(192,192)
-        self.fca2=fcattention(192,192)
-        self.fca3=fcattention(192,192)
+    def forward(self,x):
 
-        #self.
+        x=self.conv1(x)
 
-        self.enc2a_to_decoder_dim_reduction=nn.Sequential(nn.Conv2d(48,32,kernel_size=1,stride=1,bias=False),
-                                                          nn.BatchNorm2d(32),
-                                                          nn.ReLU()) 
-        self.enc2b_to_decoder_dim_reduction=nn.Sequential(nn.Conv2d(48,32,kernel_size=1,stride=1,bias=False),
-                                                          nn.BatchNorm2d(32),
-                                                          nn.ReLU()) 
-        self.enc2c_to_decoder_dim_reduction=nn.Sequential(nn.Conv2d(48,32,kernel_size=1,stride=1,bias=False),
-                                                          nn.BatchNorm2d(32),
-                                                          nn.ReLU()) 
+        x0,x1,x2,x5=self.branch0(x)
+        x3=F.interpolate(x5,x0.size()[2:],mode='bilinear',align_corners=True)
+        x1,x2,x3,x6=self.branch1(torch.cat([x0,x3],1),x1,x2)
+        x4=F.interpolate(x6,x1.size()[2:],mode='bilinear',align_corners=True)
+        x2,x3,x4,x7=self.branch2(torch.cat([x1,x4],1),x2,x3)
 
-        self.fca1_to_decoder_dim_reduction=nn.Sequential(nn.Conv2d(192,32,kernel_size=1,stride=1,bias=False),
-                                                          nn.BatchNorm2d(32),
-                                                          nn.ReLU()) 
-        self.fca2_to_decoder_dim_reduction=nn.Sequential(nn.Conv2d(192,32,kernel_size=1,stride=1,bias=False),
-                                                          nn.BatchNorm2d(32),
-                                                          nn.ReLU()) 
-        self.fca3_to_decoder_dim_reduction=nn.Sequential(nn.Conv2d(192,32,kernel_size=1,stride=1,bias=False),
-                                                          nn.BatchNorm2d(32),
-                                                          nn.ReLU()) 
+        return [x0,x1,x2,x5,x6,x7]
 
-        self.merge_conv=nn.Sequential(nn.Conv2d(32,32,kernel_size=1,stride=1,bias=False),
-                                      nn.BatchNorm2d(32),
-                                      nn.ReLU())
-        self.last_conv=nn.Sequential(nn.Conv2d(32,num_classes,kernel_size=1,stride=1,bias=False),
-                                      nn.BatchNorm2d(num_classes),
-                                      nn.ReLU())
 
-    def forward(self, x):
-        #backbone stage a
-        stage1=self.conv1(x)
-        #print("stage1:",stage1.size())
-        stage_enc2a=self.enc2a(stage1)
+class DFA_Decoder(nn.Module):
+    """
+        Decoder of DFANet.
+    """
+    def __init__(self,decode_channels,num_classes):
+        super(DFA_Decoder,self).__init__()
 
-        stage_enc3a=self.enc3a(stage_enc2a)
-        #print('stage_enc3a:',stage_enc3a.size())
+        self.conv1=nn.Sequential(nn.Conv2d(in_channels=48,out_channels=decode_channels,kernel_size=1,bias=False),
+                                 nn.BatchNorm2d(decode_channels),
+                                 nn.ReLU())
+        self.conv2=nn.Sequential(nn.Conv2d(in_channels=192,out_channels=decode_channels,kernel_size=1,bias=False),
+                                 nn.BatchNorm2d(decode_channels),
+                                 nn.ReLU())
+        # self.conv3=nn.Sequential(nn.Conv2d(in_channels=decode_channels,out_channels=num_classes,kernel_size=1,bias=False),
+        #                         nn.BatchNorm2d(num_classes),
+        #                         nn.ReLU())
+        self.conv3=nn.Conv2d(in_channels=decode_channels,out_channels=num_classes,kernel_size=1,bias=False)
 
-        stage_enc4a=self.enc4a(stage_enc3a)
-        #print('stage_enc4a:',stage_enc4a.size())
-
-        stage_fca1 =self.fca1(stage_enc4a)
-        #print(stage_fca1.size())
-        up_fca1=F.interpolate(stage_fca1,
-                                stage_enc2a.size()[2:],
-                                mode='bilinear',
-                                align_corners=False)
-
-        #print('up_fca1:',up_fca1.size())
+    def forward(self,x0,x1,x2,x3,x4,x5):
         
-        #stage b
-        stage_enc2b=self.enc2b(torch.cat((up_fca1,stage_enc2a),1))
-        #print(stage_enc2b.size())
-        stage_enc3b=self.enc3b(torch.cat((stage_enc2b,stage_enc3a),1))
-        #print(stage_enc3b.size())
-        stage_enc4b=self.enc4b(torch.cat((stage_enc3b,stage_enc4a),1))
-        stage_fca2 =self.fca2(stage_enc4b)
-        #print(stage_fca2.size())
-        up_fca2=F.interpolate(stage_fca2,
-                                stage_enc2b.size()[2:],
-                                mode='bilinear',
-                                align_corners=False)
-        # stage c
-        stage_enc2c=self.enc2c(torch.cat((up_fca2,stage_enc2b),1))
-        stage_enc3c=self.enc3c(torch.cat((stage_enc2c,stage_enc3b),1))
-        stage_enc4c=self.enc4c(torch.cat((stage_enc3c,stage_enc4b),1))
+        x1=F.interpolate(x1,x0.size()[2:],mode='bilinear',align_corners=True)
+        x2=F.interpolate(x2,x0.size()[2:],mode='bilinear',align_corners=True)
+        x3=F.interpolate(x3,x0.size()[2:],mode='bilinear',align_corners=True)
+        x4=F.interpolate(x4,x0.size()[2:],mode='bilinear',align_corners=True)
+        x5=F.interpolate(x5,x0.size()[2:],mode='bilinear',align_corners=True)
 
-        stage_fca3 =self.fca3(stage_enc4c)
-       
+        x_shallow=self.conv1(x0+x1+x2)
+        x_deep=self.conv2(x3+x4+x5)
 
-        #decoder
-        x1=self.enc2a_to_decoder_dim_reduction(stage_enc2a)
-        #print(x1.size())
-        x2=self.enc2b_to_decoder_dim_reduction(stage_enc2b)
+        x=self.conv3(x_shallow+x_deep)
+        x=F.interpolate(x,scale_factor=4,mode='bilinear',align_corners=True)
+        return x
 
-        x2_up=F.interpolate(x2,
-                        x1.size()[2:],
-                        mode='bilinear',
-                        align_corners=False)
-        x3=self.enc2c_to_decoder_dim_reduction(stage_enc2c)
-        x3_up=F.interpolate(x3,
-                        x1.size()[2:],
-                        mode='bilinear',
-                        align_corners=False)
-        #print(x3.size())
-        x_up=x1+x2_up+x3_up
+class DFANet(nn.Module):
+    def __init__(self,channel_cfg,decoder_channel,num_classes):
+        super(DFANet,self).__init__()
+        self.encoder=DFA_Encoder(channel_cfg)
+        self.decoder=DFA_Decoder(decoder_channel,num_classes)
+        weight_init(self.encoder)
+        weight_init(self.decoder)
+    def forward(self,x):
+        x0,x1,x2,x3,x4,x5=self.encoder(x)
+        x=self.decoder(x0,x1,x2,x3,x4,x5)
+        return x
 
-        x_merge=self.merge_conv(x_up)
-        #print(x_merge.size())
-        x_fca1=self.fca1_to_decoder_dim_reduction(stage_fca1)
-        #print(x_fca1.size())
-        x_fca1_up=F.interpolate(x_fca1,
-                        x1.size()[2:],
-                        mode='bilinear',
-                        align_corners=False)
-        x_fca2=self.fca2_to_decoder_dim_reduction(stage_fca2)
-        #print(x_fca2.size())
-        x_fca2_up=F.interpolate(x_fca2,
-                        x1.size()[2:],
-                        mode='bilinear',
-                        align_corners=False)
-        x_fca3=self.fca3_to_decoder_dim_reduction(stage_fca3)
 
-        #print(x_fca3.size())
-        x_fca3_up=F.interpolate(x_fca3,
-                        x1.size()[2:],
-                        mode='bilinear',
-                        align_corners=False)
-        x_fca_up=x_merge+x_fca1_up+x_fca2_up+x_fca3_up
-        #print(x_fca_up.size())
-        result=self.last_conv(x_fca_up)
-        #print(result.size())
-        result=F.interpolate(result,x.size()[2:],mode='bilinear',align_corners=False)
-        #print(result.size())
-        return result
-            
+def weight_init(module):
+    #print('initialize  ',module._get_name())
+    for n,m in module.named_children():
+        if isinstance(m,nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight,mode='fan_in',nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m,(nn.BatchNorm2d,nn.InstanceNorm2d)):
+            nn.init.ones_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m,nn.Linear):
+            nn.init.kaiming_normal_(m.weight,mode='fan_in',nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m,(nn.Sequential,
+                            SubBranch,
+                            enc,Block,
+                            SeparableConv2d,
+                            Attention,
+                            DFA_Encoder,
+                            DFA_Decoder)):
+            weight_init(m)
+        elif isinstance(m,(nn.ReLU,nn.ReLU,nn.ReLU6)):
+            pass
+        else:
+            pass
 
-def dfanet(pretrained=False, **kwargs):
+def load_backbone(dfanet,backbone_path):
     """
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    load pretrained model from backbone.
+    dfanet:graph of Dfanet.
+    backbone_path:the path of pretrained model which only saved  state dict of backbone.
+    return: graph of Dfanet with pretraind params.
     """
-    model = xceptionAx3(**kwargs)
-    if pretrained:
-        pretrained_params=torch.load('model_ilsvrc_xeception_0022.pt')['model_state_dict']
-        new_state_dict=pretrained_params.copy()
-        for key in pretrained_params.keys():
-            if  key.find('enc2')>0:
-                for x in ['enc2a','enc2b','enc2c']:
-                    new_key=key.replace('enc2',x)
-                    new_state_dict[new_key]=pretrained_params[key]
-            if not key.find('enc3')>0:
-                for x in ['enc3a','enc3b','enc3c']:
-                    new_key=key.replace('enc3',x)
-                    new_state_dict[new_key]=pretrained_params[key]  
-            if not key.find('enc4')>0:
-                for x in ['enc4a','enc4b','enc4c']:
-                    new_key=key.replace('enc4',x)
-                    new_state_dict[new_key]=pretrained_params[key]
-        pop_keys=[]
-        for key in new_state_dict.keys():
-            if  key.find('reps.0.first_conv.0.')>0:
-                pop_keys.append(key)
-            if key.find('.reps.0.skip.weight')>0:
-                pop_keys.append(key)
+    bk_params=torch.load(backbone_path)
+    df_params=dfanet.state_dict()
+    bk_keys=bk_params.keys()
 
-        for key in pop_keys:
-            new_state_dict.pop(key)
-        model.load_state_dict(new_state_dict,strict=False)
-    return model
+    for key in bk_keys:
+        if key.split('.')[0]=='conv1':
+            new_key='encoder.'+key
+            if df_params[new_key].size()==bk_params[key].size():
+                df_params[new_key]=bk_params[key]
 
-if __name__ =="__main__":
-    from torch.nn import CrossEntropyLoss
-    criterion=CrossEntropyLoss()
+        if 'branch' in key.split('.'):
+            new_key="encoder."+key 
+            new_key=new_key.replace('branch','branch0')
+            if bk_params[key].size()==df_params[new_key].size():
+                df_params[new_key]=bk_params[key]
+            else:
+                print("uninit ",new_key)
+                
+            new_key=new_key.replace('branch0','branch1')
+            if bk_params[key].size()==df_params[new_key].size():
+                df_params[new_key]=bk_params[key]
+            else:
+                print("uninit ",new_key)
+                 
+            new_key=new_key.replace('branch1','branch2')
+            if bk_params[key].size()==df_params[new_key].size():
+                df_params[new_key]=bk_params[key]
+            else:
+                print("uninit ",new_key)
+                
+    dfanet.load_state_dict(df_params)
+    return dfanet
 
-    net=dfanet(pretrained=True,num_classes=20)
-    #net=enc(in_channels=8,out_channels=48,stage=2)
 
-    input = torch.randn(4, 3, 1024, 1024)
-    outputs=net(input)
+if __name__=='__main__':
+   
+    import time
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    #torch.save(net.state_dict(),"model.pth")
+    ch_cfg=[[8,48,96],
+            [240,144,288],
+            [240,144,288]]
+
+    #backbone test.
+    bk=XceptionA(ch_cfg[0],num_classes=19)
+    torch.save(bk.state_dict(),'./backbone.pth')
+
+    dfa=DFANet(ch_cfg,64,19)
+    dfa=load_backbone(dfa,'./backbone.pth')
+
+    print("test loading pretrained backbone weight sucessfully...")
+
+    input = torch.randn(16, 3, 512, 512)
+    
+    outputs=bk(input)
     print(outputs.size())
+    print("test bcakbone ,XceptionA, sucessfully...")
 
-
+    #decoder test
+    #input=input.to(device)
+    net=DFANet(ch_cfg,64,19)
+    #net=net.to(device)
+    net(input)
+    start=time.time()
+    outputs=net(input)
+    end=time.time()
+    
+    print(outputs.size())
+    print("inference time",end-start)
+    print("test DFANet sucessfully...")
